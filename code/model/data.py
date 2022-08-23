@@ -75,6 +75,7 @@ def normalize(data, config):
     for k in keys:
         data[k] = (data[k] - normalizarion_means[k]) / (normalizarion_stds[k] + 1e-6)
         data[k].clamp_(-15, 15)
+        data[k] = data[k].cuda()
     data[f"target/history/lstm_data_diff"] *= data[f"target/history/valid_diff"]
     data[f"other/history/lstm_data_diff"] *= data[f"other/history/valid_diff"]
     data[f"target/history/lstm_data"] *= data[f"target/history/valid"]

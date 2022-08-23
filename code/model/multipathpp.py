@@ -1,6 +1,13 @@
 import torch
 from torch import nn
 from .modules import MCGBlock, HistoryEncoder, MLP, NormalMLP, Decoder, DecoderHandler, EM, MHA
+import pytorch_lightning as pl
+from .losses import pytorch_neg_multi_log_likelihood_batch, nll_with_covariances
+from .data import get_dataloader, dict_to_cuda, normalize
+from torch.optim import Adam
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+import numpy as np
+
 
 class MultiPathPP(nn.Module):
     def __init__(self, config):
@@ -88,3 +95,122 @@ class MultiPathPP(nn.Module):
         assert torch.isfinite(covariance_matrices).all()
 
         return probas, coordinates, covariance_matrices, loss_coeff
+
+
+class MultiPathPPPredictor(pl.LightningModule):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.model = MultiPathPP(config["model"])
+        self.num_steps = 0
+
+    def forward(self, data, num_steps):
+        return self.model(self, data, num_steps)
+
+    def training_step(self, batch, batch_idx):
+        if self.config["train"]["normalize"]:
+            batch = normalize(batch, self.config)
+        dict_to_cuda(batch)
+        xy_future_gt = batch["target/future/xy"]
+        valid = batch["target/future/valid"].squeeze(-1)
+        probas, coordinates, covariance_matrices, loss_coeff = self.model(batch, self.num_steps)
+        self.num_steps += 1
+
+        loss = self.loss(
+            xy_future_gt, coordinates, probas, valid,
+            covariance_matrices) * loss_coeff
+
+        self.log('train_loss', loss)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        if self.config["train"]["normalize"]:
+            batch = normalize(batch, self.config)
+        dict_to_cuda(batch)
+        xy_future_gt = batch["target/future/xy"]
+        valid = batch["target/future/valid"].squeeze(-1)
+        probas, coordinates, covariance_matrices, loss_coeff = self.model(batch, self.num_steps)
+        self.num_steps += 1
+
+        loss = self.loss(
+            xy_future_gt, coordinates, probas, valid,
+            covariance_matrices) * loss_coeff
+
+        self.log('val_loss', loss)
+        return loss
+
+    def test_step(self, batch, batch_idx):
+        pass
+
+    def test_epoch_end(self, res_list):
+        pass
+
+    def test_epoch_end(self, res_list):
+        pass
+
+    def test_epoch_end(self, res_list):
+        pass
+
+    def train_dataloader(self):
+        train_dataloader = get_dataloader(self.config["train"]["data_config"])
+        return train_dataloader
+
+    def val_dataloader(self):
+        val_dataloader = get_dataloader(self.config["val"]["data_config"])
+        return val_dataloader
+
+    def test_dataloader(self):
+        test_dataloader = get_dataloader(self.config["test"]["data_config"])
+        return test_dataloader
+
+    def on_after_backward(self):
+        pass
+
+    """
+    def configure_optimizers(self):
+        optimizer = Adam(self.model.parameters(), self.config["train"]["optimizer"]["lr"])
+        if self.config["train"]["scheduler"]:
+            scheduler = ReduceLROnPlateau(optimizer, patience=20, factor=0.5, verbose=True)
+        else:
+            return optimizer
+        return [optimizer], [scheduler]
+    """
+
+    def configure_optimizers(self):
+        optimizer = Adam(self.model.parameters(), self.config["train"]["optimizer"]["lr"])
+        scheduler = ReduceLROnPlateau(optimizer, patience=20, factor=0.5, verbose=True)
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': scheduler,  # Changed scheduler to lr_scheduler
+            'monitor': 'val_loss'
+        }
+
+    def loss(self, gt, predictions, confidences, avails, covariance_matrices):
+        precision_matrices = torch.inverse(covariance_matrices)
+        gt = torch.unsqueeze(gt, 1)
+        avails = avails[:, None, :, None]
+        coordinates_delta = (gt - predictions).unsqueeze(-1)
+        errors = coordinates_delta.permute(0, 1, 2, 4, 3) @ precision_matrices @ coordinates_delta
+        errors = avails * (-0.5 * errors.squeeze(-1) - 0.5 * torch.logdet(covariance_matrices).unsqueeze(-1))
+
+        with np.errstate(divide="ignore"):
+            errors = nn.functional.log_softmax(confidences, dim=1) + \
+                     torch.sum(errors, dim=[2, 3])
+        errors = -torch.logsumexp(errors, dim=-1, keepdim=True)
+
+        return torch.mean(errors)
+
+    def export_jit(self, device='cuda'):
+        self.eval()
+        dl = self.val_dataloader()
+        example_input = []
+        for batch in enumerate(dl):
+            batch = batch.to(device)
+            dict_to_cuda(batch)
+            example_input = (batch, self.num_steps)
+            break
+
+        model = torch.jit.trace(self.model.to(device), example_input)
+        model.to(device)
+
+        return model
